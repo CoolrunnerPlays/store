@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LedgerFlow</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f4e78'/%3E%3Cpath d='M8 22h16M8 16h16M8 10h16' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #16191d;
+  --muted: #666e79;
+  --line: #e2e5ea;
+  --accent: #1f4e78;
+  --accent-ink: #ffffff;
+  --ok: #17724a;
+  --warn: #a4560c;
+  --warn-bg: #fdf4e7;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b; --panel: #1c2026; --ink: #e9ecf1; --muted: #9aa3af;
+    --line: #2c323a; --accent: #4f8fd0; --accent-ink: #0d1116;
+    --ok: #4ec08c; --warn: #e0a25c; --warn-bg: #2a2118;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  padding: 26px 24px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { margin: 0; font-size: 21px; letter-spacing: -0.01em; }
+header p { margin: 6px 0 0; color: var(--muted); font-size: 14px; max-width: 70ch; }
+main { max-width: 1080px; margin: 0 auto; padding: 24px 24px 80px; }
+section {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 20px 22px; margin-bottom: 18px;
+}
+section[hidden] { display: none; }
+h2 { font-size: 15px; margin: 0 0 14px; display: flex; align-items: center; gap: 9px; }
+h2 .num {
+  width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-ink);
+  display: grid; place-items: center; font-size: 12px; font-weight: 700; flex: none;
+}
+.drops { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 720px) { .drops { grid-template-columns: 1fr; } }
+.drop {
+  border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 22px 18px;
+  text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+}
+.drop:hover, .drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.drop strong { display: block; font-size: 14px; }
+.drop span { color: var(--muted); font-size: 13px; }
+.drop ul { text-align: left; margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+button {
+  font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 10px 18px;
+  background: var(--accent); color: var(--accent-ink); cursor: pointer;
+}
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.nowrap { white-space: nowrap; }
+.scroll { overflow-x: auto; }
+select, input[type=text] {
+  font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); max-width: 100%;
+}
+.tag {
+  display: inline-block; font-size: 11.5px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.tag.formula { border-color: var(--accent); color: var(--accent); }
+.tag.warn { border-color: var(--warn); color: var(--warn); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 4px 0 0; }
+.stat { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+.stat b { display: block; font-size: 21px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.stat span { color: var(--muted); font-size: 12.5px; }
+.notice {
+  border: 1px solid var(--warn); background: var(--warn-bg); color: var(--warn);
+  border-radius: 8px; padding: 12px 14px; font-size: 13.5px; margin-top: 14px;
+}
+.notice ul { margin: 8px 0 0; padding-left: 18px; }
+.muted { color: var(--muted); font-size: 13px; }
+.err { color: #b3261e; font-size: 13.5px; margin-top: 10px; }
+.spin { display: inline-block; width: 13px; height: 13px; border: 2px solid currentColor;
+  border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+a.download {
+  display: inline-block; text-decoration: none; background: var(--ok); color: #fff;
+  padding: 11px 20px; border-radius: 8px; font-weight: 600;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>LedgerFlow</h1>
+  <p>Adds this week's bank statements and invoices to the spreadsheet you already keep. Your existing
+     rows, formatting and formulas stay as they are &mdash; the totals just grow to cover the new rows.</p>
+</header>
+
+<main>
+  <section id="step1">
+    <h2><span class="num">1</span> Your files</h2>
+    <div class="drops">
+      <div class="drop" id="dropBook">
+        <strong>Your spreadsheet</strong>
+        <span>.xlsx or .xlsm &mdash; the filled one you keep</span>
+        <ul id="bookList"></ul>
+      </div>
+      <div class="drop" id="dropDocs">
+        <strong>This week's documents</strong>
+        <span>Bank statement and invoice PDFs</span>
+        <ul id="docList"></ul>
+      </div>
+    </div>
+    <input type="file" id="bookInput" accept=".xlsx,.xlsm" hidden>
+    <input type="file" id="docInput" multiple accept=".pdf,.png,.jpg,.jpeg,.json" hidden>
+    <div class="row">
+      <button id="analyze" disabled>Read my files</button>
+      <span class="muted" id="step1msg">Nothing is uploaded anywhere &mdash; this runs on your own machine.</span>
+    </div>
+    <div class="err" id="err1"></div>
+  </section>
+
+  <section id="step2" hidden>
+    <h2><span class="num">2</span> Where the rows go</h2>
+    <div class="row" style="margin-top:0">
+      <label>Sheet <select id="sheetPick"></select></label>
+      <label><input type="checkbox" id="dedupe" checked> Skip rows already in the book</label>
+      <label><input type="checkbox" id="sortDate" checked> Sort new rows by date</label>
+    </div>
+    <p class="muted" id="sheetInfo"></p>
+    <div class="scroll">
+      <table id="mapTable">
+        <thead><tr><th>Column</th><th>Your header</th><th>Gets filled with</th><th>Notes</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="step3" hidden>
+    <h2><span class="num">3</span> What will be added</h2>
+    <div class="stats" id="previewStats"></div>
+    <p class="muted" id="skipNote"></p>
+    <div class="scroll" style="margin-top:16px; max-height:420px; overflow-y:auto">
+      <table id="previewTable"><thead></thead><tbody></tbody></table>
+    </div>
+    <div id="flagBox"></div>
+    <div class="row">
+      <button id="commit">Add these to my spreadsheet</button>
+      <span class="muted">A new copy is written. Your original file is never changed.</span>
+    </div>
+  </section>
+
+  <section id="step4" hidden>
+    <h2><span class="num">4</span> Done</h2>
+    <div class="stats" id="finalStats"></div>
+    <div class="row"><a class="download" id="downloadLink" href="#">Download the updated spreadsheet</a></div>
+    <p class="muted" id="finalNote"></p>
+    <div id="finalFlags"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = { book: null, docs: [], job: null, profile: null, sheets: {}, fields: [] };
+
+function wireDrop(zone, input, multiple) {
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("over"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("over"));
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault(); zone.classList.remove("over");
+    accept([...e.dataTransfer.files], multiple);
+  });
+  input.addEventListener("change", () => accept([...input.files], multiple));
+}
+
+function accept(files, multiple) {
+  if (multiple) state.docs = state.docs.concat(files);
+  else if (files.length) state.book = files[0];
+  render();
+}
+
+function render() {
+  $("bookList").innerHTML = state.book ? `<li>${state.book.name}</li>` : "";
+  $("docList").innerHTML = state.docs.map(f => `<li>${f.name}</li>`).join("");
+  $("analyze").disabled = !state.book || !state.docs.length;
+}
+
+wireDrop($("dropBook"), $("bookInput"), false);
+wireDrop($("dropDocs"), $("docInput"), true);
+
+fetch("/api/fields").then(r => r.json()).then(f => state.fields = f);
+
+$("analyze").addEventListener("click", async () => {
+  $("err1").textContent = "";
+  $("analyze").disabled = true;
+  $("step1msg").innerHTML = '<span class="spin"></span> Reading the documents…';
+
+  const body = new FormData();
+  body.append("workbook", state.book);
+  state.docs.forEach(f => body.append("documents", f));
+
+  try {
+    const res = await fetch("/api/analyze", { method: "POST", body });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Something went wrong reading the files.");
+    state.job = data.job;
+    state.sheets = data.sheets;
+    state.profile = data.profile;
+    fillSheets(data);
+    $("step2").hidden = false;
+    $("step3").hidden = false;
+    await refreshPreview();
+    $("step2").scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    $("err1").textContent = e.message;
+  } finally {
+    $("analyze").disabled = false;
+    $("step1msg").textContent = "Nothing is uploaded anywhere — this runs on your own machine.";
+  }
+});
+
+function fillSheets(data) {
+  const pick = $("sheetPick");
+  pick.innerHTML = Object.keys(data.sheets)
+    .map(n => `<option ${n === data.default_sheet ? "selected" : ""}>${n}</option>`).join("");
+  pick.onchange = () => { state.profile.sheet = pick.value; buildMapping(); refreshPreview(); };
+  $("dedupe").onchange = () => { state.profile.skip_duplicates = $("dedupe").checked; refreshPreview(); };
+  $("sortDate").onchange = () => { state.profile.sort_by_date = $("sortDate").checked; refreshPreview(); };
+  buildMapping();
+}
+
+function buildMapping() {
+  const sheet = state.sheets[state.profile.sheet];
+  $("sheetInfo").textContent =
+    `Headers on row ${sheet.header_row}. ${sheet.rows} rows of data already there, ending at row ${sheet.last_data_row}.` +
+    (sheet.totals_rows.length ? ` Totals on row ${sheet.totals_rows.join(", ")} will be extended to cover the new rows.` : "");
+
+  const body = $("mapTable").querySelector("tbody");
+  body.innerHTML = sheet.columns.map(col => {
+    const chosen = state.profile.columns[col.letter] || "";
+    if (col.computed) {
+      return `<tr><td><b>${col.letter}</b></td><td>${col.header}</td>
+        <td><span class="tag formula">its own formula, copied down</span></td>
+        <td class="muted"><code>${col.formula}</code></td></tr>`;
+    }
+    const options = ['<option value="">— leave empty —</option>']
+      .concat(state.fields.map(f => `<option value="${f}" ${f === chosen ? "selected" : ""}>${f}</option>`));
+    return `<tr><td><b>${col.letter}</b></td><td>${col.header || '<span class="muted">(no header)</span>'}</td>
+      <td><select data-col="${col.letter}">${options.join("")}</select></td>
+      <td class="muted">${col.type}</td></tr>`;
+  }).join("");
+
+  body.querySelectorAll("select").forEach(sel => {
+    sel.onchange = () => {
+      const letter = sel.dataset.col;
+      if (sel.value) state.profile.columns[letter] = sel.value;
+      else delete state.profile.columns[letter];
+      refreshPreview();
+    };
+  });
+}
+
+async function refreshPreview() {
+  const res = await fetch("/api/preview", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job: state.job, profile: state.profile })
+  });
+  const data = await res.json();
+  if (!res.ok) return;
+
+  $("previewStats").innerHTML = [
+    stat(data.added, "rows to add"),
+    stat(data.duplicates, "already in the book"),
+    stat(data.other_kind, "not for this sheet"),
+    stat(data.first_new_row, "first new row")
+  ].join("");
+
+  const kinds = state.profile.kinds.join(" and ");
+  $("skipNote").textContent = data.other_kind
+    ? `${data.other_kind} record${data.other_kind > 1 ? "s were" : " was"} left out because this sheet is set up for ` +
+      `${kinds} rows. Pick a sheet with matching columns, or add the missing columns to this one.`
+    : "";
+
+  const letters = Object.keys(state.profile.columns).sort();
+  const sheet = state.sheets[state.profile.sheet];
+  const headerFor = (l) => (sheet.columns.find(c => c.letter === l) || {}).header || l;
+  $("previewTable").querySelector("thead").innerHTML =
+    `<tr>${letters.map(l => `<th>${headerFor(l)}</th>`).join("")}<th>From</th></tr>`;
+  $("previewTable").querySelector("tbody").innerHTML = data.rows.map(r => {
+    const cells = letters.map(l => {
+      const v = r.cells[l];
+      const numeric = typeof v === "number";
+      const isDate = typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+      return `<td class="${numeric ? "num" : (isDate ? "nowrap" : "")}">${v === null || v === undefined ? "" :
+        (numeric ? v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : v)}</td>`;
+    }).join("");
+    const warn = r.confidence === "uncertain" ? ' <span class="tag warn">check</span>' : "";
+    return `<tr>${cells}<td class="muted">${r.source}${warn}</td></tr>`;
+  }).join("");
+
+  $("commit").disabled = data.added === 0;
+  $("commit").textContent = data.added === 0
+    ? "Nothing new to add" : `Add these ${data.added} rows to my spreadsheet`;
+}
+
+function stat(value, label) {
+  return `<div class="stat"><b>${value}</b><span>${label}</span></div>`;
+}
+
+function money(value) {
+  return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+$("commit").addEventListener("click", async () => {
+  $("commit").disabled = true;
+  $("commit").innerHTML = '<span class="spin"></span> Writing…';
+  const res = await fetch("/api/commit", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job: state.job, profile: state.profile })
+  });
+  const data = await res.json();
+  $("commit").textContent = "Add these to my spreadsheet";
+  if (!res.ok) { $("commit").disabled = false; return; }
+
+  const s = data.summary;
+  $("finalStats").innerHTML = [
+    stat(s.invoices, "invoices processed"),
+    stat(s.transactions, "bank transactions"),
+    stat(money(s.money_in), "money in"),
+    stat(money(s.money_out), "money out"),
+    stat(money(s.net_added), "net change added"),
+    stat(s.flags, "flagged for review")
+  ].join("");
+  $("finalNote").textContent =
+    `Written into '${s.sheet}' from row ${s.first_new_row}. ${s.formulas_updated} formulas were re-pointed so ` +
+    `your existing totals cover the new rows. ${s.duplicates} rows were skipped as already present.`;
+  $("downloadLink").href = data.download;
+  $("downloadLink").setAttribute("download", data.filename);
+  $("finalFlags").innerHTML = flagHtml(data.flags);
+  $("step4").hidden = false;
+  $("step4").scrollIntoView({ behavior: "smooth" });
+});
+
+function flagHtml(flags) {
+  if (!flags || !flags.length) return "";
+  return `<div class="notice"><b>${flags.length} item${flags.length > 1 ? "s" : ""} to check by hand</b>
+    <ul>${flags.map(f => `<li><b>${f.source}</b> ${f.location ? "(" + f.location + ")" : ""} — ${f.reason}</li>`).join("")}</ul>
+    <div class="muted" style="margin-top:8px">These are also written to a "Review Notes" sheet in the file.</div></div>`;
+}
+</script>
+</body>
+</html>

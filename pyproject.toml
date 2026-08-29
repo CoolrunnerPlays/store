@@ -1,0 +1,27 @@
+[project]
+name = "ledgerflow"
+version = "0.1.0"
+description = "Append weekly bank-statement and invoice data into an existing Excel workbook without disturbing its formatting or formulas."
+requires-python = ">=3.10"
+dependencies = [
+    "openpyxl>=3.1",
+    "pdfplumber>=0.11",
+    "python-dateutil>=2.8",
+    "Flask>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+ledgerflow = "ledgerflow.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ledgerflow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
