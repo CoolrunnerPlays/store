@@ -332,8 +332,12 @@ $("commit").addEventListener("click", async () => {
     body: JSON.stringify({ job: state.job, profile: state.profile })
   });
   const data = await res.json();
-  $("commit").textContent = "Add these to my spreadsheet";
-  if (!res.ok) { $("commit").disabled = false; return; }
+  if (!res.ok) {
+    $("commit").disabled = false;
+    $("commit").textContent = "Add these to my spreadsheet";
+    return;
+  }
+  $("commit").textContent = "Added to your spreadsheet";
 
   const s = data.summary;
   $("finalStats").innerHTML = [
