@@ -2,14 +2,14 @@
 
 The rules this module keeps, in priority order:
 
-1. Nothing already in the file changes meaning. Existing rows, styles, column
-   widths, freeze panes and formulas come out the way they went in.
-2. Totals stay correct. Rows go *inside* the table, and every formula in the
+1. Nothing already in the file changes. Existing rows, styles, row heights,
+   column widths, freeze panes and formulas come out the way they went in, and
+   this is verified against the original after writing rather than assumed.
+2. Nothing is written unless there is something new to write. A run that finds
+   only duplicates stops before the workbook is opened for modification.
+3. Totals stay correct. Rows go *inside* the table, and every formula in the
    workbook is re-pointed so the existing SUMs cover the new rows.
-3. Numbers are numbers. Amounts are written as numeric cells so the user's own
-   formulas keep working.
-4. Running it twice does not double up. Records carry a content fingerprint and
-   already-present rows are skipped.
+4. Numbers are numbers, written as numeric cells so the user's formulas work.
 """
 
 from __future__ import annotations
@@ -19,34 +19,65 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .formulas import shift_for_insert, shift_range_ref, translate_rows
 from .introspect import TableInfo, describe_sheet, describe_workbook
 from .mapping import MONEY_FIELDS, Profile, value_for
+from .matching import ExistingRow, Matcher, MatchResult, cents, coerce_date
 from .models import Flag, Record
 
 STATE_SHEET = "_LedgerFlow"
 REVIEW_SHEET = "Review Notes"
+
+Status = Literal["written", "no_new_records", "nothing_extracted", "unsafe_to_match", "dry_run"]
+
+NO_NEW_MESSAGE = "0 new transactions found (100% duplicate history)"
+
+
+@dataclass
+class Judgement:
+    """One extracted record and what the matcher decided about it."""
+
+    record: Record
+    match: MatchResult
+
+    @property
+    def status(self) -> str:
+        return self.match.status
 
 
 @dataclass
 class AppendResult:
     """What one run did, in the terms the summary needs."""
 
-    output: Path
+    output: Path | None
     sheet: str
+    status: Status = "written"
+    message: str = ""
     added: list[Record] = field(default_factory=list)
-    skipped_duplicates: list[Record] = field(default_factory=list)
+    duplicates: list[Judgement] = field(default_factory=list)
+    probable_duplicates: list[Judgement] = field(default_factory=list)
+    unmatchable: list[Judgement] = field(default_factory=list)
     skipped_other_kind: list[Record] = field(default_factory=list)
     flags: list[Flag] = field(default_factory=list)
     first_new_row: int = 0
     formulas_updated: int = 0
+    verified: bool = False
+    """True when the written file was re-read and its untouched region matched the original."""
+
+    @property
+    def file_written(self) -> bool:
+        return self.status == "written" and self.output is not None
+
+    @property
+    def skipped_duplicates(self) -> list[Record]:
+        """Every record held back as already present, however it was matched."""
+        return [j.record for j in self.duplicates + self.probable_duplicates]
 
     @property
     def invoices(self) -> list[Record]:
@@ -79,6 +110,10 @@ class AppendResult:
         return total
 
 
+class PreservationError(RuntimeError):
+    """Raised when the written file does not match the original where it should."""
+
+
 def append_records(
     workbook_path: str | Path,
     records: Iterable[Record],
@@ -88,73 +123,196 @@ def append_records(
     flags: list[Flag] | None = None,
     track_state: bool = True,
     dry_run: bool = False,
+    verify: bool = True,
 ) -> AppendResult:
-    """Append records to the sheet named by ``profile`` and save a new file."""
+    """Append records to the sheet named by ``profile``.
+
+    The workbook is only opened for modification once there is at least one
+    record that is genuinely not already in it. A run with nothing new leaves the
+    file alone and says so; it does not write an identical copy.
+    """
     workbook_path = Path(workbook_path)
     output = Path(output_path) if output_path else workbook_path.with_name(
         f"{workbook_path.stem}_updated{workbook_path.suffix}"
     )
 
-    wb = load_workbook(workbook_path, data_only=False, keep_vba=workbook_path.suffix.lower() == ".xlsm")
-    if profile.sheet not in wb.sheetnames:
-        raise ValueError(f"Sheet {profile.sheet!r} is not in {workbook_path.name}")
-    ws = wb[profile.sheet]
+    plan = plan_append(workbook_path, records, profile, flags=flags)
+    plan.output = None
 
-    table = describe_sheet(ws)
-    if table is None:
-        raise ValueError(f"No data table could be found on sheet {profile.sheet!r}")
+    if plan.status != "written":
+        return plan
+    if dry_run:
+        plan.status = "dry_run"
+        return plan
 
-    result = AppendResult(output=output, sheet=profile.sheet, flags=list(flags or []))
+    plan.output = output
+    _perform_append(workbook_path, output, plan, profile, track_state=track_state)
+
+    if verify:
+        _verify_untouched(workbook_path, output, profile.sheet, plan.first_new_row, len(plan.added))
+        plan.verified = True
+    return plan
+
+
+def plan_append(
+    workbook_path: str | Path,
+    records: Iterable[Record],
+    profile: Profile,
+    *,
+    flags: list[Flag] | None = None,
+) -> AppendResult:
+    """Decide what would be appended, without opening the file for writing.
+
+    This is the whole safety story: every abort happens here, before anything is
+    modified. The web preview and the command line both run this first and show
+    the user its verdict.
+    """
+    workbook_path = Path(workbook_path)
+    wb = load_workbook(workbook_path, data_only=False, read_only=True)
+    try:
+        if profile.sheet not in wb.sheetnames:
+            raise ValueError(f"Sheet {profile.sheet!r} is not in {workbook_path.name}")
+        table = describe_sheet(wb[profile.sheet])
+        if table is None:
+            raise ValueError(f"No data table could be found on sheet {profile.sheet!r}")
+        existing = read_existing_rows(wb[profile.sheet], table, profile)
+    finally:
+        wb.close()
+
+    result = AppendResult(output=None, sheet=profile.sheet, flags=list(flags or []))
+    result.first_new_row = _insertion_row(table)
 
     wanted, result.skipped_other_kind = _split_by_kind(records, profile)
-    known = _existing_fingerprints(wb, ws, table, profile) if profile.skip_duplicates else set()
-    fresh: list[Record] = []
-    for record in wanted:
-        key = record.fingerprint()
-        if key in known:
-            result.skipped_duplicates.append(record)
-            continue
-        known.add(key)
-        fresh.append(record)
 
-    if profile.sort_by_date:
-        fresh.sort(key=lambda r: (r.date or date.max, r.description))
+    if not wanted:
+        result.status = "nothing_extracted"
+        result.message = (
+            "Nothing was extracted for this sheet. "
+            f"{len(result.skipped_other_kind)} record(s) belonged to a different kind of sheet."
+            if result.skipped_other_kind
+            else "No records were extracted from the documents provided."
+        )
+        return result
+
+    matcher = Matcher(rows=existing) if profile.skip_duplicates else Matcher(rows=[])
+
+    # Fail closed: if the sheet has rows but none of them could be read well
+    # enough to compare against, appending would risk a second copy of the book.
+    if profile.skip_duplicates and table.row_count > 0 and matcher.usable_rows == 0:
+        result.status = "unsafe_to_match"
+        result.message = (
+            f"'{profile.sheet}' has {table.row_count} rows, but none of them could be read as a "
+            "date and an amount, so new records cannot be checked against them. Nothing was written. "
+            "Check that the Date and amount columns are mapped correctly."
+        )
+        return result
+
+    fresh: list[Record] = []
+    for record in _sorted(wanted, profile):
+        verdict = matcher.find(record)
+        judgement = Judgement(record, verdict)
+        if verdict.status == "duplicate":
+            result.duplicates.append(judgement)
+        elif verdict.status == "probable_duplicate":
+            result.probable_duplicates.append(judgement)
+            result.flags.append(
+                Flag(
+                    source=record.source,
+                    location=f"row {verdict.row} of '{profile.sheet}'" if verdict.row else "",
+                    field="duplicate",
+                    raw=f"{record.date} {record.description[:40]}",
+                    reason=f"Held back as a likely duplicate: {verdict.reason}. "
+                           "It was not added; add it by hand if it is genuinely a separate transaction.",
+                    row_key=record.fingerprint(),
+                )
+            )
+        elif verdict.status == "unmatchable":
+            result.unmatchable.append(judgement)
+            result.flags.append(
+                Flag(
+                    source=record.source,
+                    location=f"page {record.page}" if record.page else "",
+                    field="amount",
+                    raw=record.description[:60],
+                    reason=verdict.reason + " It was not added.",
+                    row_key=record.fingerprint(),
+                )
+            )
+        else:
+            fresh.append(record)
+            matcher.add(record)
 
     result.added = fresh
-    if dry_run or (not fresh and not result.flags):
-        result.first_new_row = _insertion_row(table)
-        return result
 
     if not fresh:
-        # Nothing new to append, but there are things to look at. The notes are
-        # worth a file on their own; the ledger itself is untouched.
-        result.first_new_row = _insertion_row(table)
-        _write_review_notes(wb, result)
-        wb.save(output)
+        result.status = "no_new_records"
+        result.message = NO_NEW_MESSAGE
         return result
 
-    at_row = _insertion_row(table)
-    count = len(fresh)
-    result.first_new_row = at_row
-
-    style_source = table.last_data_row if table.last_data_row > table.header_row else None
-
-    ws.insert_rows(at_row, count)
-    result.formulas_updated = _repoint_workbook(wb, profile.sheet, at_row, count)
-    _repair_ranges(ws, at_row, count)
-
-    for offset, record in enumerate(fresh):
-        row = at_row + offset
-        if style_source is not None:
-            _copy_row_style(ws, style_source, row, table)
-        _write_row(ws, row, record, table, profile, style_source)
-
-    _write_review_notes(wb, result)
-    if track_state:
-        _write_state(wb, [r.fingerprint() for r in fresh])
-
-    wb.save(output)
+    result.status = "written"
     return result
+
+
+def _sorted(records: list[Record], profile: Profile) -> list[Record]:
+    if not profile.sort_by_date:
+        return list(records)
+    return sorted(records, key=lambda r: (r.date or date.max, r.description))
+
+
+def read_existing_rows(ws: Worksheet, table: TableInfo, profile: Profile) -> list[ExistingRow]:
+    """Reduce the rows already in the sheet to what the matcher compares on.
+
+    Dates typed as text are parsed, and the amount is taken from whichever of the
+    mapped money columns the book actually uses.
+    """
+    by_field = {field_name: letter for letter, field_name in profile.columns.items()}
+    values = {
+        row: {
+            letter: ws[f"{letter}{row}"].value
+            for letter in profile.columns
+        }
+        for row in range(table.first_data_row, table.last_data_row + 1)
+    }
+
+    rows: list[ExistingRow] = []
+    for row, cells in values.items():
+        def cell(field_name: str):
+            letter = by_field.get(field_name)
+            if not letter:
+                return None
+            value = cells.get(letter)
+            return None if isinstance(value, str) and value.startswith("=") else value
+
+        amount = _numeric(cell("amount"))
+        if amount is None:
+            deposit, withdrawal = _numeric(cell("deposit")), _numeric(cell("withdrawal"))
+            if deposit or withdrawal:
+                amount = (deposit or Decimal(0)) - (withdrawal or Decimal(0))
+        if amount is None:
+            amount = _numeric(cell("total"))
+
+        description = cell("description") or cell("payee") or cell("vendor") or ""
+        reference = cell("reference") or ""
+
+        rows.append(
+            ExistingRow(
+                row=row,
+                date=coerce_date(cell("date")),
+                description=str(description),
+                reference=str(reference),
+                amount_cents=cents(amount),
+            )
+        )
+    return rows
+
+
+def _numeric(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, (str, datetime, date)):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
 
 
 def _insertion_row(table: TableInfo) -> int:
@@ -169,73 +327,57 @@ def _split_by_kind(records: Iterable[Record], profile: Profile) -> tuple[list[Re
     return wanted, rejected
 
 
-def _existing_fingerprints(wb, ws: Worksheet, table: TableInfo, profile: Profile) -> set[str]:
-    """Fingerprints of rows already in the book.
+def _perform_append(
+    source: Path, output: Path, plan: AppendResult, profile: Profile, *, track_state: bool
+) -> None:
+    """Do the actual writing. Only reached when there is something new to add."""
+    wb = load_workbook(source, data_only=False, keep_vba=source.suffix.lower() == ".xlsm")
+    ws = wb[profile.sheet]
+    table = describe_sheet(ws)
 
-    Read from the tracking sheet where one exists, and always recomputed from the
-    visible rows as well, so a book that was filled in by hand before this tool
-    existed still dedupes correctly on the first run.
+    at_row = _insertion_row(table)
+    count = len(plan.added)
+    plan.first_new_row = at_row
+    style_source = table.last_data_row if table.last_data_row > table.header_row else None
+
+    ws.insert_rows(at_row, count)
+    _shift_row_dimensions(ws, at_row, count)
+    plan.formulas_updated = _repoint_workbook(wb, profile.sheet, at_row, count)
+    _repair_ranges(ws, at_row, count)
+
+    for offset, record in enumerate(plan.added):
+        row = at_row + offset
+        if style_source is not None:
+            _copy_row_style(ws, style_source, row, table)
+        _write_row(ws, row, record, table, profile, style_source)
+
+    _write_review_notes(wb, plan)
+    if track_state:
+        _write_state(wb, plan.added)
+
+    wb.save(output)
+
+
+def _shift_row_dimensions(ws: Worksheet, at_row: int, count: int) -> None:
+    """Move row heights and row-level styles down with the rows they belong to.
+
+    openpyxl's insert_rows moves the cells but leaves row_dimensions bound to the
+    old row numbers, so every row below the insertion point inherits the height
+    and outline of whatever row now sits at its index. On a book with custom row
+    heights that reads as the whole sheet below the insert being mangled.
     """
-    known: set[str] = set()
+    existing = {index: dimension for index, dimension in ws.row_dimensions.items()}
+    moved = {index: dimension for index, dimension in existing.items() if index >= at_row}
+    if not moved:
+        return
 
-    if STATE_SHEET in wb.sheetnames:
-        for row in wb[STATE_SHEET].iter_rows(min_row=2, max_col=1, values_only=True):
-            if row[0]:
-                known.add(str(row[0]))
+    for index in moved:
+        del ws.row_dimensions[index]
 
-    by_field = {field: letter for letter, field in profile.columns.items()}
-    for row in range(table.first_data_row, table.last_data_row + 1):
-        record = _row_to_record(ws, row, by_field, profile)
-        if record is not None:
-            known.add(record.fingerprint())
-    return known
-
-
-def _row_to_record(ws: Worksheet, row: int, by_field: dict[str, str], profile: Profile) -> Record | None:
-    """Rebuild enough of a Record from an existing row to fingerprint it."""
-
-    def cell(field_name: str):
-        letter = by_field.get(field_name)
-        if not letter:
-            return None
-        value = ws[f"{letter}{row}"].value
-        return None if isinstance(value, str) and value.startswith("=") else value
-
-    when = cell("date")
-    if isinstance(when, datetime):
-        when = when.date()
-    description = cell("description") or cell("payee") or cell("vendor") or ""
-    reference = cell("reference") or ""
-
-    amount = _as_decimal(cell("amount"))
-    if amount is None:
-        deposit, withdrawal = _as_decimal(cell("deposit")), _as_decimal(cell("withdrawal"))
-        if deposit is not None or withdrawal is not None:
-            amount = (deposit or Decimal(0)) - (withdrawal or Decimal(0))
-    total = _as_decimal(cell("total"))
-
-    if when is None and not description and amount is None and total is None:
-        return None
-
-    kind = "invoice" if profile.kinds == ["invoice"] else "transaction"
-    return Record(
-        kind=kind,
-        source="existing",
-        date=when if isinstance(when, date) else None,
-        description=str(description),
-        reference=str(reference),
-        amount=amount,
-        total=total,
-    )
-
-
-def _as_decimal(value: Any) -> Decimal | None:
-    if value is None or isinstance(value, str):
-        return None
-    try:
-        return Decimal(str(value)).quantize(Decimal("0.01"))
-    except Exception:
-        return None
+    for index in sorted(moved, reverse=True):
+        dimension = moved[index]
+        dimension.index = index + count
+        ws.row_dimensions[index + count] = dimension
 
 
 def _repoint_workbook(wb, target_sheet: str, at_row: int, count: int) -> int:
@@ -315,14 +457,25 @@ def _repair_ranges(ws: Worksheet, at_row: int, count: int) -> None:
 
 
 def _copy_row_style(ws: Worksheet, source_row: int, target_row: int, table: TableInfo) -> None:
-    """Give a new row the same look as the row it follows."""
+    """Give a new row exactly the look of the row it follows.
+
+    Every style facet is copied explicitly -- font family, size, weight, colour,
+    fill, all four borders, alignment, protection and number format -- rather
+    than leaving any of them to Excel's defaults.
+    """
     for col in range(table.first_col, table.last_col + 1):
         source = ws.cell(row=source_row, column=col)
         target = ws.cell(row=target_row, column=col)
-        target._style = copy(source._style)
-    height = ws.row_dimensions[source_row].height
-    if height is not None:
-        ws.row_dimensions[target_row].height = height
+        target.font = copy(source.font)
+        target.fill = copy(source.fill)
+        target.border = copy(source.border)
+        target.alignment = copy(source.alignment)
+        target.protection = copy(source.protection)
+        target.number_format = source.number_format
+
+    source_dimension = ws.row_dimensions.get(source_row)
+    if source_dimension is not None and source_dimension.height is not None:
+        ws.row_dimensions[target_row].height = source_dimension.height
 
 
 def _write_row(
@@ -373,7 +526,6 @@ def _write_review_notes(wb, result: AppendResult) -> None:
         start = ws.max_row + 2
     else:
         ws = wb.create_sheet(REVIEW_SHEET)
-        start = 1
         headers = ["Run", "Source file", "Where", "Field", "Value as read", "Why it needs checking"]
         for index, name in enumerate(headers, start=1):
             cell = ws.cell(row=1, column=index, value=name)
@@ -395,21 +547,103 @@ def _write_review_notes(wb, result: AppendResult) -> None:
             cell.alignment = Alignment(vertical="top", wrap_text=index == 6)
 
 
-def _write_state(wb, fingerprints: list[str]) -> None:
-    """Record what has been added, so next week's run knows what is already in."""
+def _write_state(wb, records: list[Record]) -> None:
+    """Record what has been added, for auditing which run a row came from."""
     if STATE_SHEET in wb.sheetnames:
         ws = wb[STATE_SHEET]
     else:
         ws = wb.create_sheet(STATE_SHEET)
-        ws["A1"] = "fingerprint"
-        ws["B1"] = "added"
+        for index, name in enumerate(["fingerprint", "added", "source", "date", "amount"], start=1):
+            ws.cell(row=1, column=index, value=name)
         ws.sheet_state = "hidden"
 
     stamp = datetime.now().isoformat(timespec="seconds")
     row = ws.max_row + 1
-    for offset, fingerprint in enumerate(fingerprints):
-        ws.cell(row=row + offset, column=1, value=fingerprint)
+    for offset, record in enumerate(records):
+        amount = record.amount if record.amount is not None else record.total
+        ws.cell(row=row + offset, column=1, value=record.fingerprint())
         ws.cell(row=row + offset, column=2, value=stamp)
+        ws.cell(row=row + offset, column=3, value=record.source)
+        ws.cell(row=row + offset, column=4, value=record.date.isoformat() if record.date else "")
+        ws.cell(row=row + offset, column=5, value=float(amount) if amount is not None else None)
+
+
+def _rgb(holder) -> str | None:
+    """Colour of a style element, tolerating the many ways openpyxl leaves it unset."""
+    colour = getattr(holder, "color", None) if holder is not None else None
+    rgb = getattr(colour, "rgb", None)
+    return str(rgb) if rgb is not None else None
+
+
+def _side(border, name: str) -> tuple:
+    side = getattr(border, name, None)
+    return (getattr(side, "style", None), _rgb(side))
+
+
+def _style_signature(cell) -> tuple:
+    """Everything about a cell's appearance that must survive the round trip."""
+    font, fill, border, alignment = cell.font, cell.fill, cell.border, cell.alignment
+    return (
+        font.name, font.sz, font.b, font.i, font.u, font.strike, _rgb(font),
+        fill.patternType,
+        str(getattr(fill.fgColor, "rgb", None)) if getattr(fill, "fgColor", None) is not None else None,
+        str(getattr(fill.bgColor, "rgb", None)) if getattr(fill, "bgColor", None) is not None else None,
+        _side(border, "left"), _side(border, "right"), _side(border, "top"), _side(border, "bottom"),
+        alignment.horizontal, alignment.vertical, alignment.wrapText, alignment.indent,
+        cell.number_format,
+    )
+
+
+def _verify_untouched(source: Path, output: Path, sheet: str, at_row: int, count: int) -> None:
+    """Re-read the written file and prove the pre-existing content is unchanged.
+
+    Values, every style facet and row heights are compared cell by cell: rows
+    above the insertion point against themselves, and rows below against their
+    new positions. A guarantee that is never checked is only a hope, and this is
+    the check.
+    """
+    before_wb = load_workbook(source, data_only=False)
+    after_wb = load_workbook(output, data_only=False)
+    problems: list[str] = []
+
+    for name in before_wb.sheetnames:
+        if name not in after_wb.sheetnames:
+            problems.append(f"sheet '{name}' is missing from the output")
+            continue
+        before, after = before_wb[name], after_wb[name]
+        shift = count if name == sheet else 0
+
+        for row in range(1, before.max_row + 1):
+            target_row = row + shift if (shift and row >= at_row) else row
+            for col in range(1, before.max_column + 1):
+                old = before.cell(row=row, column=col)
+                new = after.cell(row=target_row, column=col)
+                if _style_signature(old) != _style_signature(new):
+                    problems.append(f"{name}!{old.coordinate}: formatting changed")
+                # Formulas on the target sheet are deliberately re-pointed.
+                is_formula = isinstance(old.value, str) and old.value.startswith("=")
+                if not is_formula and old.value != new.value:
+                    problems.append(f"{name}!{old.coordinate}: value changed from {old.value!r} to {new.value!r}")
+                if len(problems) > 12:
+                    break
+
+            old_height = before.row_dimensions[row].height
+            new_height = after.row_dimensions[target_row].height
+            if old_height != new_height:
+                problems.append(f"{name} row {row}: height changed from {old_height} to {new_height}")
+            if len(problems) > 12:
+                break
+
+        for letter, dimension in before.column_dimensions.items():
+            after_dimension = after.column_dimensions.get(letter)
+            if after_dimension is None or after_dimension.width != dimension.width:
+                problems.append(f"{name} column {letter}: width changed")
+
+    if problems:
+        raise PreservationError(
+            "The written file does not match the original where it should. Nothing was returned. "
+            + "; ".join(problems[:12])
+        )
 
 
 def choose_sheet(workbook_path: str | Path) -> tuple[str, dict[str, TableInfo]]:

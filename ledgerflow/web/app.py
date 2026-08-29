@@ -1,8 +1,9 @@
-"""A small local web app: drop the workbook and the week's documents in, check
-what was found, then download the updated file.
+"""A small local web app: drop the workbook and the week's documents in, read
+the audit of what was found, then approve the append.
 
-Everything stays on the machine it runs on. Uploads go to a per-job temporary
-folder and nothing is sent anywhere.
+Nothing is written to a spreadsheet until the audit has been shown and the
+Approve button pressed. Everything stays on the machine it runs on; uploads go
+to a per-job temporary folder and are not sent anywhere.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Any
 
 from flask import Flask, jsonify, request, send_file
 
-from ..append import append_records, choose_sheet
+from ..append import AppendResult, PreservationError, append_records, choose_sheet, plan_append
 from ..extract import extract_records
 from ..mapping import SYNONYMS, Profile, suggest_profile, value_for
 from ..models import Flag, Record
@@ -40,14 +41,64 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _record_json(record: Record) -> dict[str, Any]:
-    data = {k: _json_safe(v) for k, v in asdict(record).items()}
-    data["fingerprint"] = record.fingerprint()
-    return data
-
-
 def _flag_json(flag: Flag) -> dict[str, Any]:
     return asdict(flag)
+
+
+def _audit_rows(result: AppendResult, profile: Profile) -> list[dict[str, Any]]:
+    """Every extracted record with its verdict and the cells it would fill.
+
+    One list covering all four outcomes, so the browser can render the whole
+    audit in a single table and colour each row by what will happen to it.
+    """
+    rows: list[dict[str, Any]] = []
+
+    def add(record: Record, status: str, reason: str = "", matched_row: int | None = None) -> None:
+        rows.append(
+            {
+                "status": status,
+                "reason": reason,
+                "matched_row": matched_row,
+                "source": record.source,
+                "kind": record.kind,
+                "confidence": record.confidence,
+                "cells": {
+                    letter: _json_safe(value_for(record, field))
+                    for letter, field in profile.columns.items()
+                },
+            }
+        )
+
+    for record in result.added:
+        add(record, "new")
+    for judgement in result.duplicates:
+        add(judgement.record, "duplicate", judgement.match.reason, judgement.match.row)
+    for judgement in result.probable_duplicates:
+        add(judgement.record, "probable_duplicate", judgement.match.reason, judgement.match.row)
+    for judgement in result.unmatchable:
+        add(judgement.record, "unmatchable", judgement.match.reason)
+    for record in result.skipped_other_kind:
+        add(record, "other_kind", f"This sheet takes {' and '.join(profile.kinds)} rows.")
+    return rows
+
+
+def _audit_payload(result: AppendResult, profile: Profile) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "message": result.message,
+        "rows": _audit_rows(result, profile),
+        "counts": {
+            "new": len(result.added),
+            "duplicate": len(result.duplicates),
+            "probable_duplicate": len(result.probable_duplicates),
+            "unmatchable": len(result.unmatchable),
+            "other_kind": len(result.skipped_other_kind),
+            "flags": len(result.flags),
+        },
+        "first_new_row": result.first_new_row,
+        "can_append": result.status in ("written", "dry_run") and bool(result.added),
+        "flags": [_flag_json(f) for f in result.flags],
+    }
 
 
 @app.get("/")
@@ -63,12 +114,12 @@ def fields():
 
 @app.post("/api/analyze")
 def analyze():
-    """Read everything, detect the layout, and report without writing anything."""
+    """Read everything, detect the layout, and audit it. Writes nothing."""
     workbook = request.files.get("workbook")
     if workbook is None or not workbook.filename:
-        return jsonify(error="Choose the spreadsheet you keep your records in."), 400
+        return jsonify(error="Choose the Excel template you keep your records in."), 400
     if not workbook.filename.lower().endswith((".xlsx", ".xlsm")):
-        return jsonify(error="The workbook needs to be an .xlsx or .xlsm file."), 400
+        return jsonify(error="The template needs to be an .xlsx or .xlsm file."), 400
 
     job_id = uuid.uuid4().hex[:12]
     workdir = Path(tempfile.mkdtemp(prefix=f"ledgerflow-{job_id}-"))
@@ -82,6 +133,10 @@ def analyze():
         target = workdir / Path(upload.filename).name
         upload.save(target)
         documents.append(target)
+
+    if not documents:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return jsonify(error="Add at least one statement or invoice."), 400
 
     try:
         default_sheet, tables = choose_sheet(book_path)
@@ -106,15 +161,9 @@ def analyze():
         )
 
     profile = suggest_profile(tables[default_sheet])
-    JOBS[job_id] = {
-        "dir": workdir,
-        "book": book_path,
-        "records": records,
-        "flags": flags,
-        "tables": tables,
-    }
+    JOBS[job_id] = {"dir": workdir, "book": book_path, "records": records, "flags": flags, "tables": tables}
 
-    preview = append_records(book_path, records, profile, flags=flags, dry_run=True)
+    audit = plan_append(book_path, records, profile, flags=flags)
 
     return jsonify(
         job=job_id,
@@ -142,47 +191,26 @@ def analyze():
         default_sheet=default_sheet,
         profile=asdict(profile),
         files=per_file,
-        preview=[_record_json(r) for r in preview.added],
-        duplicates=[_record_json(r) for r in preview.skipped_duplicates],
-        other_kind=[_record_json(r) for r in preview.skipped_other_kind],
-        flags=[_flag_json(f) for f in flags],
+        audit=_audit_payload(audit, profile),
     )
 
 
 @app.post("/api/preview")
 def preview():
-    """Re-run the dry run after the mapping has been edited in the browser."""
+    """Re-run the audit after the mapping has been edited in the browser."""
     payload = request.get_json(force=True)
     job = JOBS.get(payload.get("job", ""))
     if job is None:
         return jsonify(error="That session has expired. Upload the files again."), 404
 
     profile = Profile(**payload["profile"])
-    result = append_records(job["book"], job["records"], profile, flags=job["flags"], dry_run=True)
-    rows = [
-        {
-            "cells": {
-                letter: _json_safe(value_for(record, field))
-                for letter, field in profile.columns.items()
-            },
-            "kind": record.kind,
-            "source": record.source,
-            "confidence": record.confidence,
-        }
-        for record in result.added
-    ]
-    return jsonify(
-        rows=rows,
-        added=len(result.added),
-        duplicates=len(result.skipped_duplicates),
-        other_kind=len(result.skipped_other_kind),
-        first_new_row=result.first_new_row,
-    )
+    audit = plan_append(job["book"], job["records"], profile, flags=job["flags"])
+    return jsonify(_audit_payload(audit, profile))
 
 
 @app.post("/api/commit")
 def commit():
-    """Write the file for real and hand back a download link."""
+    """Write the file, but only when the audit found something new to write."""
     payload = request.get_json(force=True)
     job = JOBS.get(payload.get("job", ""))
     if job is None:
@@ -192,12 +220,27 @@ def commit():
     book: Path = job["book"]
     output = job["dir"] / f"{book.stem}_updated{book.suffix}"
 
-    result = append_records(book, job["records"], profile, output_path=output, flags=job["flags"])
-    job["output"] = result.output if result.output.exists() else None
+    try:
+        result = append_records(book, job["records"], profile, output_path=output, flags=job["flags"])
+    except PreservationError as error:
+        return jsonify(error=str(error), status="preservation_failed"), 500
+
+    if not result.file_written:
+        # The safety check fired: the workbook was never opened for modification.
+        return jsonify(
+            status=result.status,
+            message=result.message,
+            download=None,
+            audit=_audit_payload(result, profile),
+        )
+
+    job["output"] = result.output
 
     return jsonify(
-        download=f"/download/{payload['job']}" if job["output"] else None,
+        status="written",
+        download=f"/download/{payload['job']}",
         filename=output.name,
+        verified=result.verified,
         summary={
             "invoices": len(result.invoices),
             "transactions": len(result.transactions),
@@ -205,7 +248,9 @@ def commit():
             "money_out": float(result.money_out),
             "invoice_total": float(result.invoice_total),
             "net_added": float(result.total_added),
-            "duplicates": len(result.skipped_duplicates),
+            "duplicates": len(result.duplicates),
+            "probable_duplicates": len(result.probable_duplicates),
+            "unmatchable": len(result.unmatchable),
             "other_kind": len(result.skipped_other_kind),
             "flags": len(result.flags),
             "formulas_updated": result.formulas_updated,

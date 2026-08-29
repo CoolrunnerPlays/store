@@ -10,13 +10,15 @@ table, and re-points your formulas so the totals you already have grow to cover 
 
 | | |
 |---|---|
-| Existing rows | Never touched. Verified cell by cell in the test suite. |
+| Existing rows | Never touched. Verified cell by cell in the written file, on every run. |
 | Formatting | New rows inherit the styling, number formats and row height of the rows above. |
 | Your formulas | `=SUM(D4:D11)` becomes `=SUM(D4:D23)`. Cross-sheet formulas on a Summary tab are updated too. |
 | Per-row formulas | A calculated column such as `Net = Deposit - Withdrawal` is filled down onto the new rows. |
 | Excel tables | A ListObject range, the autofilter, conditional formats, validations and merges all grow with the table. |
 | Numbers | Written as numeric cells, so your own formulas keep working. Never as text. |
 | Your original file | Never modified. A new `_updated.xlsx` copy is written. |
+| Row heights | Shifted with their rows on insert, which openpyxl does not do by itself. |
+| Every write | Re-read and compared against the original before you get the file. |
 
 ## Install
 
@@ -58,13 +60,58 @@ without writing anything.
 
 ## Running it twice is safe
 
-Every row carries a fingerprint built from its date, description, reference and amount.
-Rows already in the workbook are skipped and reported, so overlapping statements or a
-re-uploaded file cannot produce duplicates. This works even on a book that was filled in
-by hand long before this tool existed, because the fingerprints of the existing rows are
-recomputed from the sheet itself.
+A record is compared against what is already in the sheet on the two things that
+come from the document rather than from anyone's typing: **the date and the amount**.
+The description is used only to confirm, and is compared loosely, so all of these
+still count as the same transaction:
 
-A hidden `_LedgerFlow` sheet records what has been added. Pass `--no-state` to leave it out.
+- the payee typed a person's own way (`AWS CLOUD SERVICES` vs `Aws - Cloud Services`);
+- a date stored as the text `03/07/2026` instead of a real date cell;
+- an outgoing recorded as a positive number in a Withdrawal column while the parser
+  reads it as a negative net amount;
+- a posting date a day or two off (held back and reported, not added).
+
+An invoice number matching settles the question on its own.
+
+Every record ends up in one of four buckets, and all four are shown before anything
+is written:
+
+| Verdict | What happens |
+|---|---|
+| **New** | Appended. |
+| **Duplicate** | Already in the file. Excluded, with the row number it matched. |
+| **Probable duplicate** | Same amount, date a few days out. Excluded and reported, so you can add it by hand if it really is separate. |
+| **Unreadable** | No amount could be read, so it cannot be checked. Excluded and flagged. |
+
+## The pre-commit safety check
+
+**If there is nothing new, nothing is written.** A run that finds only duplicates
+stops before the workbook is opened for modification, reports
+
+```
+0 new transactions found (100% duplicate history)
+```
+
+and leaves your file byte-identical. No output copy is produced either — an
+identical file would only be something else to keep track of.
+
+The run also aborts, untouched, when the sheet has rows but none of them can be read
+as a date and an amount. Being unable to compare is a reason to stop, not a reason to
+append.
+
+## Every write is verified
+
+After writing, the output is re-opened and compared against the original cell by cell:
+value, font family, size, weight, colour, fill, all four borders, alignment, number
+format, row heights and column widths. Rows above the insertion point are compared
+against themselves; rows below against their new positions. If anything that should
+have been left alone has changed, the write is rejected with `PreservationError` and
+you get no file rather than a damaged one.
+
+This exists because openpyxl's `insert_rows` moves cells but leaves `row_dimensions`
+bound to the old row numbers, so every row below an insert silently inherits the wrong
+height. LedgerFlow shifts them itself, and the verifier proves it on your actual file
+rather than asking you to take it on trust.
 
 ## When something cannot be read
 
@@ -118,7 +165,7 @@ ledgerflow/
   extract/        statement, invoice and document-routing parsers
   web/            the browser front end
   cli.py          inspect / add / web
-tests/            69 tests, including a full round trip through the web API
+tests/            109 tests, including the audit regressions and a web round trip
 ```
 
 ## Tests
@@ -129,5 +176,10 @@ pytest
 ```
 
 The suite builds workbooks with the awkward parts a real book has — a title above the
-header, per-row formulas, a totals block, an Excel table, a summary sheet pointing at the
-data — and asserts that an append leaves all of it correct.
+header, per-row formulas, a totals block, custom row heights, an Excel table, a summary
+sheet pointing at the data — and asserts that an append leaves all of it correct.
+
+`tests/test_audit_regression.py` pins the failures found in the audit run: a workbook
+already holding every transaction must gain nothing and must not be rewritten, across
+four ways a person's own book differs from the parser's reading. Two of its tests
+deliberately reintroduce the old bugs to prove the verifier catches them.

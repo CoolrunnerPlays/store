@@ -12,7 +12,7 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
-from .append import append_records, choose_sheet
+from .append import PreservationError, append_records, choose_sheet
 from .extract import extract_records
 from .introspect import TableInfo
 from .mapping import Profile, suggest_profile
@@ -119,15 +119,31 @@ def cmd_add(args) -> int:
     if args.sheet:
         profile.sheet = args.sheet
 
-    result = append_records(
-        args.workbook,
-        records,
-        profile,
-        output_path=args.out,
-        flags=flags,
-        dry_run=args.dry_run,
-        track_state=not args.no_state,
-    )
+    try:
+        result = append_records(
+            args.workbook,
+            records,
+            profile,
+            output_path=args.out,
+            flags=flags,
+            dry_run=args.dry_run,
+            track_state=not args.no_state,
+        )
+    except PreservationError as error:
+        print(f"\nAborted: {error}", file=sys.stderr)
+        print("Your workbook was not changed.", file=sys.stderr)
+        return 1
+
+    # A run that finds nothing new stops before the file is opened for writing.
+    if result.status in ("no_new_records", "nothing_extracted", "unsafe_to_match"):
+        print(f"\n{'=' * 62}")
+        print(f"  {result.message}")
+        print(f"{'=' * 62}")
+        print(f"  Checked against  {len(result.duplicates) + len(result.probable_duplicates)} matching rows "
+              f"already in '{result.sheet}'")
+        print("  Nothing was written. Your workbook is untouched.")
+        _print_held_back(result)
+        return 0
 
     print("\n" + "=" * 62)
     print(f"  Invoices processed          {len(result.invoices)}")
@@ -136,12 +152,18 @@ def cmd_add(args) -> int:
     print(f"  Money out                   {_money(result.money_out)}")
     print(f"  Invoice value               {_money(result.invoice_total)}")
     print(f"  Net change added            {_money(result.total_added)}")
-    if result.skipped_duplicates:
-        print(f"  Already in the book         {len(result.skipped_duplicates)} (skipped)")
+    if result.duplicates:
+        print(f"  Already in the book         {len(result.duplicates)} (skipped)")
+    if result.probable_duplicates:
+        print(f"  Probable duplicates         {len(result.probable_duplicates)} (held back)")
+    if result.unmatchable:
+        print(f"  Could not be checked        {len(result.unmatchable)} (held back)")
     if result.skipped_other_kind:
         print(f"  Not for this sheet          {len(result.skipped_other_kind)} (skipped)")
     print(f"  Flagged for review          {len(result.flags)}")
     print("=" * 62)
+
+    _print_held_back(result)
 
     if result.flags:
         print("\nNeeds a human eye:")
@@ -152,15 +174,31 @@ def cmd_add(args) -> int:
 
     if args.dry_run:
         print("\nDry run: nothing was written.")
-        if result.added:
-            print(f"Would insert {len(result.added)} rows at row {result.first_new_row} of '{result.sheet}'.")
-    elif result.added:
-        print(f"\nWrote {len(result.added)} rows into '{result.sheet}' starting at row {result.first_new_row}.")
-        print(f"{result.formulas_updated} formulas re-pointed so the existing totals cover them.")
-        print(f"Saved: {result.output}")
-    else:
-        print("\nNothing new to add - everything in these documents is already in the book.")
+        print(f"Would insert {len(result.added)} rows at row {result.first_new_row} of '{result.sheet}'.")
+        return 0
+
+    print(f"\nWrote {len(result.added)} rows into '{result.sheet}' starting at row {result.first_new_row}.")
+    print(f"{result.formulas_updated} formulas re-pointed so the existing totals cover them.")
+    if result.verified:
+        print("Verified: every pre-existing cell, style and row height matches the original.")
+    print(f"Saved: {result.output}")
     return 0
+
+
+def _print_held_back(result) -> None:
+    """Show what was deliberately not added, so a skip is never silent."""
+    for title, judgements in (
+        ("Held back as probable duplicates", result.probable_duplicates),
+        ("Held back because they could not be checked", result.unmatchable),
+    ):
+        if not judgements:
+            continue
+        print(f"\n{title}:")
+        for judgement in judgements[:10]:
+            record = judgement.record
+            print(f"  - {record.date} {record.description[:44]:44s} {judgement.match.reason}")
+        if len(judgements) > 10:
+            print(f"  ... and {len(judgements) - 10} more.")
 
 
 def cmd_web(args) -> int:
